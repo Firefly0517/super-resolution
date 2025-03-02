@@ -36,7 +36,7 @@ class BaseModule(QWidget):
 
 
 class SRModule(BaseModule):
-    MODULE_NAME = "多模态超分对比"
+    MODULE_NAME = "多模态超分"
     ICON = "icon_sr.png"
 
     def __init__(self):
@@ -194,7 +194,7 @@ class SRModule(BaseModule):
 
             # 更新显示
             self.update_display(modality)
-            self.update_slider_range()
+            self.update_slider_range(modality)
 
         except Exception as e:
             getattr(self, f"{modality}_drop").setText(f"加载失败: {str(e)}")
