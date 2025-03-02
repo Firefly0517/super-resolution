@@ -1,7 +1,7 @@
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QStackedWidget, QListWidget, QHBoxLayout,
-    QVBoxLayout, QLabel, QPushButton, QFileDialog, QTextBrowser, QApplication
+    QVBoxLayout, QLabel, QPushButton, QFileDialog, QTextBrowser, QCheckBox, QApplication
 )
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QIcon
@@ -9,6 +9,10 @@ from PySide6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QSlider
 from PySide6.QtWidgets import QComboBox
 from PySide6.QtWidgets import QListWidgetItem
+from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtGui import QIcon, QPixmap, QImage
+from PySide6.QtWidgets import QLineEdit
+from PySide6.QtGui import QIntValidator
 
 import sys
 import json
@@ -32,82 +36,335 @@ class BaseModule(QWidget):
 
 
 class SRModule(BaseModule):
-    """超分功能模块（含医学图像查看功能）"""
-    MODULE_NAME = "超分辨率重建"
+    MODULE_NAME = "多模态超分对比"
     ICON = "icon_sr.png"
 
     def __init__(self):
         super().__init__()
-        self.image_data = None  # 存储加载的图像数据（numpy数组）
-        self.current_slice = 0  # 当前显示切片序号
-        self.orientation = 0  # 显示方向（0:轴向 1:矢状 2:冠状）
-        self.image_shape = None
-        self.rotation_angle = 0  # 旋转角度（0, 90, 180, 270）
+        self.image_data = {
+            "low_res": None,  # 低分辨率图像
+            "high_res": None  # 高分辨率参考图像
+        }
+        self.current_settings = {
+            "low_res": {"slice": 0, "orientation": 0, "rotation": 0},
+            "high_res": {"slice": 0, "orientation": 0, "rotation": 0}
+        }
+        self.sync_controls = True  # 是否同步控制
 
     def init_ui(self):
         self.layout = QVBoxLayout(self)
 
-        # 文件拖放区域
-        self.drop_label = QLabel("拖放医学图像文件至此（支持.nii.gz/.dcm）")
-        self.drop_label.setAlignment(Qt.AlignCenter)
-        self.drop_label.setStyleSheet("""
+        # 创建双视图容器
+        views_container = QWidget()
+        views_layout = QHBoxLayout(views_container)
+
+        # 初始化两个独立视图
+        views_layout.addWidget(self.create_view("低分辨率图像", "low_res"))
+        views_layout.addWidget(self.create_view("高分辨率参考", "high_res"))
+
+        self.layout.addWidget(views_container)
+
+    def create_view(self, title, modality):
+        """创建包含独立控制的视图"""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
+        # 标题标签
+        title_label = QLabel(title)
+        title_label.setAlignment(Qt.AlignCenter)
+
+        # 拖放区域
+        drop_label = DropTargetLabel(modality)
+        drop_label.setAcceptDrops(True)
+        drop_label.filesDropped.connect(self.load_image)
+
+        # 图像显示区域
+        image_label = QLabel()
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setMinimumSize(400, 400)
+        image_label.setStyleSheet("background: #333;")
+
+        # 独立控制面板
+        control_panel = self.create_control_panel(modality)
+
+        layout.addWidget(title_label)
+        layout.addWidget(drop_label)
+        layout.addWidget(image_label)
+        layout.addWidget(control_panel)
+
+        # 保存组件引用
+        setattr(self, f"{modality}_drop", drop_label)
+        setattr(self, f"{modality}_display", image_label)
+
+        return container
+
+    def create_control_panel(self, modality):
+        """创建包含输入框和滑块的控制面板"""
+        panel = QWidget()
+        main_layout = QVBoxLayout(panel)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 第一行：切片输入与滑块
+        slice_row = QHBoxLayout()
+
+        # 输入框
+        self.slice_input = QLineEdit()
+        self.slice_input.setFixedWidth(80)
+        self.slice_input.setValidator(QIntValidator())  # 限制只能输入整数
+
+        slice_label = QLabel("切片: 0/0")  # 创建切片标签
+        setattr(self, f"{modality}_slice_label", slice_label)
+
+
+        # 滑块
+        slice_slider = QSlider(Qt.Horizontal)
+
+        slice_row.addWidget(QLabel("切片位置:"))
+        slice_row.addWidget(self.slice_input)
+        slice_row.addWidget(slice_slider)
+
+        # 第二行：操作控制
+        control_row = QHBoxLayout()
+
+        # 方向选择
+        orient_combo = QComboBox()
+        orient_combo.addItems(["轴向", "矢状", "冠状"])
+
+        # 旋转按钮
+        rotate_box = QHBoxLayout()
+        rotate_left = QPushButton("↺ 逆时针")
+        rotate_right = QPushButton("↻ 顺时针")
+
+        rotate_box.addWidget(rotate_left)
+        rotate_box.addWidget(rotate_right)
+
+        control_row.addWidget(QLabel("方向:"))
+        control_row.addWidget(orient_combo)
+        control_row.addStretch()
+        control_row.addLayout(rotate_box)
+
+        # 添加行布局
+        main_layout.addLayout(slice_row)
+        main_layout.addLayout(control_row)
+
+        slice_row.addWidget(QLabel("切片位置:"))
+        slice_row.addWidget(self.slice_input)
+        slice_row.addWidget(slice_slider)
+        slice_row.addWidget(slice_label)
+
+        # 信号连接
+        orient_combo.currentIndexChanged.connect(
+            lambda idx: self.update_orientation(modality, idx)
+        )
+        slice_slider.valueChanged.connect(
+            lambda val: self.update_slice(modality, val)
+        )
+        rotate_left.clicked.connect(
+            lambda: self.rotate_image(modality, 90)
+        )
+        rotate_right.clicked.connect(
+            lambda: self.rotate_image(modality, -90)
+        )
+        slice_slider.valueChanged.connect(
+            lambda val: self.on_slider_changed(modality, val)
+        )
+        self.slice_input.returnPressed.connect(
+            lambda: self.on_input_changed(modality)
+        )
+
+        # 保存控件引用
+        setattr(self, f"{modality}_slider", slice_slider)
+        setattr(self, f"{modality}_input", self.slice_input)
+        setattr(self, f"{modality}_slice_label", slice_label)
+
+        return panel
+
+    def load_image(self, modality, filepath):
+        """加载医学图像"""
+        try:
+            # 根据文件后缀选择加载方式
+            if filepath.endswith('.nii.gz'):
+                import nibabel as nib
+                img = nib.load(filepath)
+                self.image_data[modality] = img.get_fdata()
+            elif filepath.endswith('.dcm'):
+                import pydicom
+                ds = pydicom.dcmread(filepath)
+                self.image_data[modality] = ds.pixel_array
+
+            # 更新显示
+            self.update_display(modality)
+            self.update_slider_range()
+
+        except Exception as e:
+            getattr(self, f"{modality}_drop").setText(f"加载失败: {str(e)}")
+
+    def update_display(self, modality):
+        """更新单个模态显示"""
+        data = self.image_data[modality]
+        if data is None:
+            return
+
+        settings = self.current_settings[modality]
+
+        # 提取切片
+        orientation = settings["orientation"]
+        slice_idx = settings["slice"]
+
+        if orientation == 0:  # 轴向
+            slice_data = data[slice_idx, :, :]
+        elif orientation == 1:  # 矢状
+            slice_data = data[:, slice_idx, :]
+        else:  # 冠状
+            slice_data = data[:, :, slice_idx]
+
+        # 应用旋转
+        if settings["rotation"] != 0:
+            slice_data = np.rot90(slice_data, k=settings["rotation"] // 90)
+
+        # 显示切片
+        self.display_slice(modality, slice_data)
+
+    def display_slice(self, modality, slice_data):
+        """使用Matplotlib显示单个切片"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 确保数据合法性
+            if not isinstance(slice_data, np.ndarray) or slice_data.ndim != 2:
+                raise ValueError("Invalid slice data")
+
+            # 创建新figure避免内存泄漏
+            fig = plt.figure(figsize=(5, 5), dpi=100)
+            ax = fig.add_subplot(111)
+
+            # 显示图像（自动应用归一化）
+            ax.imshow(slice_data.T,
+                      cmap='gray',
+                      origin='lower',
+                      aspect='equal')  # 保持像素方形比例
+
+            # 隐藏坐标轴
+            ax.axis('off')
+            plt.tight_layout(pad=0)
+
+            # 生成唯一临时文件名
+            temp_file = f"temp_{modality}.png"
+
+            # 保存图像（调整bbox和dpi保证画质）
+            plt.savefig(temp_file,
+                        bbox_inches='tight',
+                        pad_inches=0,
+                        dpi=100)
+            plt.close(fig)  # 显式关闭figure释放内存
+
+            # 加载并显示图像
+            pixmap = QPixmap(temp_file)
+            target_label = getattr(self, f"{modality}_display")
+
+            # 保持宽高比缩放
+            target_label.setPixmap(
+                pixmap.scaled(target_label.size(),
+                              Qt.KeepAspectRatio,
+                              Qt.SmoothTransformation)
+            )
+
+        except Exception as e:
+            print(f"显示错误 ({modality}): {str(e)}")
+            traceback.print_exc()
+
+    def update_slice(self, modality, value):
+        """更新单个模态切片"""
+        self.current_settings[modality]["slice"] = value
+        data = self.image_data[modality]
+
+        if data is not None:
+            orientation = self.current_settings[modality]["orientation"]
+            max_slice = data.shape[orientation] - 1
+            getattr(self, f"{modality}_slice_label").setText(
+                f"切片: {value}/{max_slice}"
+            )
+
+        self.update_display(modality)
+
+    def update_orientation(self, modality, index):
+        """更新单个模态方向"""
+        self.current_settings[modality]["orientation"] = index
+        self.update_slider_range(modality)
+        self.update_display(modality)
+
+
+    def rotate_image(self, modality, angle):
+        """更新单个模态旋转"""
+        current = self.current_settings[modality]["rotation"]
+        self.current_settings[modality]["rotation"] = (current + angle) % 360
+        self.update_display(modality)
+
+    def update_slider_range(self, modality):
+        """根据当前方向更新控件范围"""
+        data = self.image_data[modality]
+        if data is not None:
+            orientation = self.current_settings[modality]["orientation"]
+            max_slice = data.shape[orientation] - 1
+
+            # 更新滑块
+            slider = getattr(self, f"{modality}_slider")
+            slider.setRange(0, max_slice)
+
+            # 更新输入验证
+            input_field = getattr(self, f"{modality}_input")
+            validator = QIntValidator(0, max_slice)  # 动态设置验证范围
+            input_field.setValidator(validator)
+
+            # 更新提示文本
+            input_field.setPlaceholderText(f"0-{max_slice}")
+            getattr(self, f"{modality}_slice_label").setText(f"切片: 0/{max_slice}")
+
+    def on_slider_changed(self, modality, value):
+        """滑块变化时更新输入框"""
+        input_field = getattr(self, f"{modality}_input")
+        input_field.setText(str(value))
+        self.update_slice(modality, value)  # 调用原有的切片更新方法
+
+    def on_input_changed(self, modality):
+        """输入框变化时更新滑块"""
+        input_field = getattr(self, f"{modality}_input")
+        slider = getattr(self, f"{modality}_slider")
+
+        try:
+            value = int(input_field.text())
+            max_value = slider.maximum()
+
+            # 限制输入范围
+            if value < 0:
+                value = 0
+            elif value > max_value:
+                value = max_value
+
+            slider.setValue(value)
+            input_field.setText(str(value))  # 更新可能被修正的值
+        except ValueError:
+            # 输入无效时恢复之前的值
+            input_field.setText(str(slider.value()))
+
+
+class DropTargetLabel(QLabel):
+    filesDropped = Signal(str, str)  # (modality, filepath)
+
+    def __init__(self, modality):
+        super().__init__("拖放文件至此")
+        self.modality = modality
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("""
             QLabel { 
-                border: 2px dashed #aaa;
+                border: 2px dashed #666;
                 border-radius: 10px;
-                padding: 25px;
+                padding: 20px;
+                color: #999;
                 font-size: 14px;
             }
         """)
-        self.drop_label.setAcceptDrops(True)
 
-        # 图像显示区域
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(512, 512)
-
-        # 控制面板
-        control_panel = QWidget()
-        control_layout = QHBoxLayout()
-
-        # 方向选择
-        self.orient_combo = QComboBox()
-        self.orient_combo.addItems(["轴向", "矢状", "冠状"])
-        self.orient_combo.currentIndexChanged.connect(self.init_slider)
-        self.orient_combo.currentIndexChanged.connect(self.update_display)
-
-        # 切片滑块
-        self.slice_slider = QSlider(Qt.Horizontal)
-        self.slice_slider.valueChanged.connect(self.update_display)
-
-        # 当前切片显示
-        self.slice_label = QLabel("切片: 0/0")
-
-        # 顺时针和逆时针旋转按钮
-        self.rotate_left_button = QPushButton("逆时针旋转")
-        self.rotate_right_button = QPushButton("顺时针旋转")
-
-        # 按钮连接
-        self.rotate_left_button.clicked.connect(self.rotate_left)
-        self.rotate_right_button.clicked.connect(self.rotate_right)
-
-        control_layout.addWidget(QLabel("方向:"))
-        control_layout.addWidget(self.orient_combo)
-        control_layout.addWidget(QLabel("切片:"))
-        control_layout.addWidget(self.slice_slider)
-        control_layout.addWidget(self.slice_label)
-        control_layout.addWidget(self.rotate_left_button)  # 逆时针旋转按钮
-        control_layout.addWidget(self.rotate_right_button)  # 顺时针旋转按钮
-
-        control_panel.setLayout(control_layout)
-
-        self.layout.addWidget(self.drop_label)
-        self.layout.addWidget(self.image_label)
-        self.layout.addWidget(control_panel)
-
-        self.drop_label.dragEnterEvent = self.dragEnterEvent
-        self.drop_label.dropEvent = self.dropEvent
-
-    # 添加拖放支持
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -116,105 +373,9 @@ class SRModule(BaseModule):
         for url in event.mimeData().urls():
             filepath = url.toLocalFile()
             if filepath.endswith(('.nii.gz', '.dcm')):
-                self.load_medical_image(filepath)
+                self.filesDropped.emit(self.modality, filepath)
+                self.setText(f"已加载: {filepath.split('/')[-1]}")
                 break
-
-    def load_medical_image(self, filepath):
-        """加载医学图像文件"""
-        try:
-            if filepath.endswith('.nii.gz'):
-                import nibabel as nib
-                img = nib.load(filepath)
-                self.image_data = img.get_fdata()
-
-            elif filepath.endswith('.dcm'):
-                import pydicom
-                ds = pydicom.dcmread(filepath)
-                self.image_data = ds.pixel_array
-
-            self.image_shape = self.image_data.shape
-            print("image_data_shape:", str(self.image_shape))
-
-            self.init_slider()
-
-            self.update_display()
-
-        except Exception as e:
-            self.drop_label.setText(f"加载失败: {str(e)}")
-
-    def init_slider(self):
-        """初始化切片滑块"""
-        self.orientation = self.orient_combo.currentIndex()
-        depth = self.image_data.shape[self.orientation]
-        self.slice_slider.setRange(0, depth - 1)
-        self.slice_slider.setValue(0)
-        self.slice_label.setText(f"切片: 0/{depth - 1}")
-
-    def update_display(self):
-        """更新图像显示"""
-        if self.image_data is None:
-            return
-
-        self.current_slice = self.slice_slider.value()
-        self.orientation = self.orient_combo.currentIndex()
-
-        try:
-            # 提取切片
-            if self.orientation == 0:  # 轴向
-                slice_data = self.image_data[self.current_slice, :, :]
-            elif self.orientation == 1:  # 矢状
-                slice_data = self.image_data[:, self.current_slice, :]
-            else:  # 冠状
-                slice_data = self.image_data[:, :, self.current_slice]
-
-            # 旋转切片
-            if self.rotation_angle == 90:
-                slice_data = np.rot90(slice_data, k=1)
-            elif self.rotation_angle == 180:
-                slice_data = np.rot90(slice_data, k=2)
-            elif self.rotation_angle == 270:
-                slice_data = np.rot90(slice_data, k=3)
-
-            print("slice_data.shape:", str(slice_data.shape))
-            # 转换为QImage
-            import matplotlib.pyplot as plt
-            # 确保 slice_data 是 numpy 数组并且是二维的
-            if not isinstance(slice_data, np.ndarray):
-                raise ValueError("slice_data is not a numpy array")
-            if len(slice_data.shape) != 2:
-                raise ValueError("slice_data is not 2D")
-
-            # 使用 matplotlib 生成图像并保存
-            plt.figure(figsize=(5, 5))
-            plt.imshow(slice_data.T, cmap='gray', origin='lower')  # 转置图像以符合显示习惯
-            plt.axis('off')
-            plt.tight_layout()
-
-            # 使用 'tight' 让 matplotlib 自动调整边界
-            plt.savefig("temp_slice.png", bbox_inches='tight')
-
-            # 显示图像
-            pixmap = QPixmap("temp_slice.png")
-            self.image_label.setPixmap(pixmap.scaled(512, 512, Qt.KeepAspectRatio))
-
-            # 更新切片标签
-            depth = self.image_data.shape[self.orientation]
-            self.slice_label.setText(f"切片: {self.current_slice}/{depth - 1}")
-        except Exception as e:
-            print(f"更新显示失败: {str(e)}")
-            print("详细错误信息：")
-            traceback.print_exc()
-
-    def rotate_left(self):
-        """逆时针旋转图像"""
-        self.rotation_angle = (self.rotation_angle + 90) % 360
-        self.update_display()
-
-    def rotate_right(self):
-        """顺时针旋转图像"""
-        self.rotation_angle = (self.rotation_angle - 90) % 360
-        self.update_display()
-
 
 class HelpModule(BaseModule):
     """用户手册模块"""
